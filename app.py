@@ -4,15 +4,21 @@ import ftplib
 from flask import Flask, request, render_template, send_file, jsonify
 import requests
 from io import BytesIO
-import threading
+import logging
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 class FTPDownloader:
     @staticmethod
-    def download_ftp_file(ftp_url, save_path=None):
+    def download_ftp_file(ftp_url):
         """Faz download de um arquivo FTP"""
         try:
+            logger.info(f"Iniciando download FTP: {ftp_url}")
+            
             m = re.match(r'ftp://(?:(?P<user>[^:]+):(?P<pass>[^@]+)@)?(?P<host>[^/]+)(?P<path>/.*)', ftp_url)
             if not m:
                 return False, "URL FTP inválida"
@@ -23,20 +29,29 @@ class FTPDownloader:
             host = gd['host']
             path = gd['path']
             
+            logger.info(f"Conectando ao FTP: {host}")
+            
             # Conectar ao FTP
             ftp = ftplib.FTP(host, timeout=30)
             ftp.login(user=user, passwd=passwd)
             
             # Baixar para memória
             file_data = BytesIO()
-            ftp.retrbinary(f'RETR {path}', file_data.write)
+            
+            def callback(data):
+                file_data.write(data)
+            
+            ftp.retrbinary(f'RETR {path}', callback)
             ftp.quit()
             
             file_data.seek(0)
+            logger.info(f"Download FTP concluído: {len(file_data.getvalue())} bytes")
             return True, file_data
             
         except Exception as e:
-            return False, f"Erro no download FTP: {str(e)}"
+            error_msg = f"Erro no download FTP: {str(e)}"
+            logger.error(error_msg)
+            return False, error_msg
 
 @app.route('/')
 def index():
@@ -50,12 +65,14 @@ def navigate():
     if not url:
         return jsonify({'error': 'URL não fornecida'})
     
+    logger.info(f"Navegando para: {url}")
+    
     # Se for URL FTP, faz download
     if url.lower().startswith('ftp://'):
         success, result = FTPDownloader.download_ftp_file(url)
         if success:
             # Retorna o arquivo para download
-            filename = os.path.basename(url)
+            filename = os.path.basename(url) or "download.dat"
             return send_file(
                 result,
                 as_attachment=True,
@@ -68,20 +85,58 @@ def navigate():
     # Se for HTTP/HTTPS, faz proxy
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-        response = requests.get(url, headers=headers, timeout=30)
+        
+        response = requests.get(url, headers=headers, timeout=30, verify=False)
+        response.raise_for_status()
         
         # Modifica links para passar pelo nosso proxy
         content = response.text
-        content = re.sub(r'href="(ftp://[^"]+)"', r'href="/download?url=\1"', content)
-        content = re.sub(r'href="(http://[^"]+)"', r'href="/navigate?url=\1"', content)
-        content = re.sub(r'href="(https://[^"]+)"', r'href="/navigate?url=\1"', content)
+        
+        # Substituir links FTP
+        content = re.sub(
+            r'href="(ftp://[^"]+)"', 
+            r'href="/download?url=\1"', 
+            content, 
+            flags=re.IGNORECASE
+        )
+        
+        # Substituir links HTTP/HTTPS relativos e absolutos
+        content = re.sub(
+            r'href="((?:http://|https://)?[^"]+)"', 
+            lambda m: f'href="/navigate?url={requests.compat.urljoin(url, m.group(1))}"' 
+            if not m.group(1).startswith(('http://', 'https://', 'ftp://', '#')) and not m.group(1).startswith('javascript:') 
+            else m.group(0), 
+            content
+        )
+        
+        # Substituir ações de formulário
+        content = re.sub(
+            r'action="([^"]+)"',
+            lambda m: f'action="/navigate?url={requests.compat.urljoin(url, m.group(1))}"'
+            if not m.group(1).startswith(('http://', 'https://')) and not m.group(1).startswith('#'),
+            content
+        )
         
         return content
         
+    except requests.exceptions.RequestException as e:
+        error_msg = f'Erro ao acessar URL: {str(e)}'
+        logger.error(error_msg)
+        return f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; padding: 20px;">
+                <h2>Erro ao carregar a página</h2>
+                <p>{error_msg}</p>
+                <a href="/">Voltar para página inicial</a>
+            </body>
+        </html>
+        """
     except Exception as e:
-        return jsonify({'error': f'Erro ao acessar URL: {str(e)}'})
+        error_msg = f'Erro inesperado: {str(e)}'
+        logger.error(error_msg)
+        return jsonify({'error': error_msg})
 
 @app.route('/download')
 def download():
@@ -90,9 +145,11 @@ def download():
     if not ftp_url:
         return jsonify({'error': 'URL FTP não fornecida'})
     
+    logger.info(f"Download FTP solicitado: {ftp_url}")
+    
     success, result = FTPDownloader.download_ftp_file(ftp_url)
     if success:
-        filename = os.path.basename(ftp_url)
+        filename = os.path.basename(ftp_url) or "download.dat"
         return send_file(
             result,
             as_attachment=True,
@@ -102,23 +159,12 @@ def download():
     else:
         return jsonify({'error': result})
 
-@app.route('/api/ftp-download')
-def api_ftp_download():
-    """API para download FTP (retorna JSON)"""
-    ftp_url = request.args.get('url', '')
-    if not ftp_url:
-        return jsonify({'error': 'URL FTP não fornecida'})
-    
-    success, result = FTPDownloader.download_ftp_file(ftp_url)
-    if success:
-        return jsonify({
-            'success': True,
-            'message': 'Download concluído com sucesso',
-            'filename': os.path.basename(ftp_url)
-        })
-    else:
-        return jsonify({'success': False, 'error': result})
+@app.route('/health')
+def health():
+    """Endpoint de health check"""
+    return jsonify({'status': 'healthy', 'service': 'navegador-ftp'})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8081))
+    port = int(os.environ.get('PORT', 8080))
+    logger.info(f"Iniciando servidor na porta {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
