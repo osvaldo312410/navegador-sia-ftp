@@ -5,6 +5,7 @@ from flask import Flask, request, render_template, send_file, jsonify
 import requests
 from io import BytesIO
 import logging
+from urllib.parse import urljoin
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -53,6 +54,42 @@ class FTPDownloader:
             logger.error(error_msg)
             return False, error_msg
 
+def replace_links(content, base_url):
+    """Substitui links no conteúdo HTML para passar pelo proxy"""
+    # Substituir links FTP
+    content = re.sub(
+        r'href="(ftp://[^"]+)"', 
+        r'href="/download?url=\1"', 
+        content, 
+        flags=re.IGNORECASE
+    )
+    
+    # Substituir links HTTP/HTTPS relativos
+    def replace_http_link(match):
+        link = match.group(1)
+        if link.startswith(('http://', 'https://', 'ftp://', '#', 'javascript:')):
+            return match.group(0)  # Mantém o link original
+        else:
+            # Link relativo - converte para absoluto
+            absolute_url = urljoin(base_url, link)
+            return f'href="/navigate?url={absolute_url}"'
+    
+    content = re.sub(r'href="([^"]+)"', replace_http_link, content)
+    
+    # Substituir ações de formulário
+    def replace_form_action(match):
+        action = match.group(1)
+        if action.startswith(('http://', 'https://', '#')):
+            return match.group(0)  # Mantém a ação original
+        else:
+            # Ação relativa - converte para absoluta
+            absolute_url = urljoin(base_url, action)
+            return f'action="/navigate?url={absolute_url}"'
+    
+    content = re.sub(r'action="([^"]+)"', replace_form_action, content)
+    
+    return content
+
 @app.route('/')
 def index():
     """Página inicial com navegador embutido"""
@@ -93,31 +130,7 @@ def navigate():
         
         # Modifica links para passar pelo nosso proxy
         content = response.text
-        
-        # Substituir links FTP
-        content = re.sub(
-            r'href="(ftp://[^"]+)"', 
-            r'href="/download?url=\1"', 
-            content, 
-            flags=re.IGNORECASE
-        )
-        
-        # Substituir links HTTP/HTTPS relativos e absolutos
-        content = re.sub(
-            r'href="((?:http://|https://)?[^"]+)"', 
-            lambda m: f'href="/navigate?url={requests.compat.urljoin(url, m.group(1))}"' 
-            if not m.group(1).startswith(('http://', 'https://', 'ftp://', '#')) and not m.group(1).startswith('javascript:') 
-            else m.group(0), 
-            content
-        )
-        
-        # Substituir ações de formulário
-        content = re.sub(
-            r'action="([^"]+)"',
-            lambda m: f'action="/navigate?url={requests.compat.urljoin(url, m.group(1))}"'
-            if not m.group(1).startswith(('http://', 'https://')) and not m.group(1).startswith('#'),
-            content
-        )
+        content = replace_links(content, url)
         
         return content
         
